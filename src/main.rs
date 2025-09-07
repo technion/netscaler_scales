@@ -128,6 +128,7 @@ async fn main() {
 
     let client = Client::builder()
         .tls_info(true)
+        .danger_accept_invalid_certs(true)
         .build()
         .expect("should be able to build reqwest client");
 

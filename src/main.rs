@@ -7,8 +7,10 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
 use x509_parser::prelude::*;
+use tokio::sync::Semaphore;
+use rusqlite::Connection;
+use std::sync::{Arc, Mutex};
 
-// We don't need most of these fields, but we use this so we can copy paste the source table
 struct CitrixNetscalerVersion {
     pub rdx_en_date: String,
     pub version: String,
@@ -24,6 +26,7 @@ struct NetscalerHost {
 
 // From the source material, convert the timestamps by replacing spaces with a T
 static SOURCE: &str = include_str!("versions.csv");
+static DB_NAME: &str = "netscaler_scales.db";
 
 fn parse_source() -> Vec<CitrixNetscalerVersion> {
     SOURCE
@@ -55,23 +58,21 @@ fn extract_subject(ext: &Extensions) -> Option<String> {
     if let Some(val) = ext.get::<reqwest::tls::TlsInfo>()
         && let Some(peer_cert_der) = val.peer_certificate()
     {
-        let cert = match X509Certificate::from_der(peer_cert_der) {
+        match X509Certificate::from_der(peer_cert_der) {
             Ok((rem, cert)) => {
-                assert!(rem.is_empty());
-                assert_eq!(cert.version(), X509Version::V3);
-                Some(cert.tbs_certificate)
+                if cert.version() != X509Version::V3 || !rem.is_empty() {
+                    return None;
+                }
+                let subject = cert
+                    .tbs_certificate
+                    .subject()
+                    .iter_common_name()
+                    .next()
+                    .and_then(|cn| cn.as_str().ok());
+                return subject.map(|s| s.to_string());
             }
-            _ => None,
+            _ => Option::<String>::None,
         };
-        if let Some(tbs_cert) = cert {
-            let subject = tbs_cert
-                .subject()
-                .iter_common_name()
-                .next()
-                .and_then(|cn| cn.as_str().ok());
-            dbg!("Subject: {:?}", subject);
-            return subject.map(|s| s.to_string());
-        }
     }
     None
 }
@@ -96,7 +97,7 @@ async fn process_url(
         });
     }
     // Verify gzip header - this ensures we have a valid gzip file at the test URL
-    if  *body.slice(0..4) != *b"\x1f\x8b\x08\x08"  {
+    if *body.slice(0..4) != *b"\x1f\x8b\x08\x08" {
         return Ok(NetscalerHost {
             host_ip: host_ip.to_string(),
             version: None,
@@ -108,10 +109,7 @@ async fn process_url(
     version_bytes.copy_from_slice(&body[4..8]);
     let version_u32 = u32::from_le_bytes(version_bytes);
     let dt = Utc.timestamp_opt(version_u32 as i64, 0).single();
-    let utc_string = match dt {
-        Some(d) => Some(d.to_rfc3339()),
-        None => None,
-    };
+    let utc_string = dt.map(|d| d.to_rfc3339());
 
     Ok(NetscalerHost {
         host_ip: host_ip.to_string(),
@@ -121,11 +119,24 @@ async fn process_url(
     })
 }
 
+fn insert_netscaler_to_db(conn: &Arc<Mutex<Connection>>, host: &NetscalerHost) -> rusqlite::Result<()> {
+    let conn = conn.lock().unwrap();
+    let mut stmt = conn.prepare_cached("INSERT INTO netscaler_versions (host_ip, version, version_date, host_name) VALUES (?1,?2,?3,?4)")?;
+    stmt.execute(rusqlite::params![
+        host.host_ip,
+        host.version.as_deref().unwrap_or("Unknown"),
+        host.version_date.as_deref().unwrap_or("Unknown"),
+        host.host_name.as_deref().unwrap_or("Unknown")
+    ])?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     // Create vector of CitrixNetscalerVersion from SOURCE
     let versions: Vec<CitrixNetscalerVersion> = parse_source();
 
+    // Regardless of usual warnings, disable SSL verification is not dangerous and is needed to scan IP addresses with unknown names on certs
     let client = Client::builder()
         .tls_info(true)
         .danger_accept_invalid_certs(true)
@@ -140,12 +151,50 @@ async fn main() {
         }
     };
 
-    // Spawn all requests concurrently
+    let db_conn = match Connection::open(DB_NAME) {
+        Ok(conn) => Arc::new(Mutex::new(conn)),
+        Err(e) => {
+            eprintln!("Error opening database {}: {}", DB_NAME, e);
+            return;
+        }
+    };
+    /*
+    db_conn.execute(
+        "CREATE TABLE netscaler_versions (
+            host_ip    TEXT PRIMARY KEY,
+            version  TEXT,
+            version_date  TEXT,
+            host_name  TEXT
+        )",
+        (), // empty list of parameters.
+    ).unwrap(); */
+
+    let concurrency_limit = 256;
+    let semaphore = std::sync::Arc::new(Semaphore::new(concurrency_limit));
+
+    // Spawn all requests concurrently, but limit concurrency
     let futures = hosts.map_while(Result::ok).map(|host_ip| {
         let client = &client;
-
         let versions = &versions;
+        let semaphore = semaphore.clone();
+        let db_conn = Arc::clone(&db_conn);
+
         async move {
+            // Acquire a permit before proceeding
+            let _permit = semaphore.acquire_owned().await.unwrap();
+
+            let valid_ip = host_ip.parse::<std::net::IpAddr>().is_ok();
+            if !valid_ip {
+                let scanned_host: NetscalerHost = NetscalerHost {
+                    host_ip: host_ip.to_string(),
+                    version: Some("Unknown".to_string()),
+                    version_date: None,
+                    host_name: Some("Invalid IP address".to_string()),
+                };
+                let _ = insert_netscaler_to_db(&db_conn, &scanned_host);
+                return dbg!(scanned_host);
+            }
+
             match process_url(client, &host_ip).await {
                 Ok(mut scanned_host) => {
                     let default_version = "Unknown".to_string();
@@ -158,6 +207,7 @@ async fn main() {
                         .find(|v| v.rdx_en_date == *version_date)
                         .map_or("Unknown", |v| &v.version);
                     scanned_host.version = Some(version.to_string());
+                    let _ = insert_netscaler_to_db(&db_conn, &scanned_host);
                     dbg!(scanned_host)
                 }
                 Err(e) => {
@@ -167,9 +217,11 @@ async fn main() {
                         version_date: None,
                         host_name: Some(e.to_string()),
                     };
+                    let _ = insert_netscaler_to_db(&db_conn, &scanned_host);
                     dbg!(scanned_host)
                 }
             }
+            // _permit is dropped here, releasing the slot
         }
     });
 

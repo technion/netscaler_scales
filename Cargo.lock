@@ -823,6 +823,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "futures",
+ "http",
  "reqwest",
  "tokio",
  "x509-parser",

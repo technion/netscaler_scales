@@ -23,3 +23,10 @@ https://github.com/fox-it/citrix-netscaler-triage/blob/main/scan-citrix-netscale
 - No unsafe
 - Panic free
 - Resilient errors on any individual host
+
+## Creating a hosts list
+
+```powershell
+$csv = import-csv ".\CVE-2025-7775-Citrix-Netscaler.csv" -Header "IP"
+$csv | Sort-Object -Property IP -Unique | Export-Csv -NoTypeInformation hosts.txt
+```

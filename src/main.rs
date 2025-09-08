@@ -27,6 +27,7 @@ struct NetscalerHost {
 // From the source material, convert the timestamps by replacing spaces with a T
 static SOURCE: &str = include_str!("versions.csv");
 static DB_NAME: &str = "netscaler_scales.db";
+const CONCURRENCY_LIMIT: usize = 256;
 
 fn parse_source() -> Vec<CitrixNetscalerVersion> {
     SOURCE
@@ -69,7 +70,7 @@ fn extract_subject(ext: &Extensions) -> Option<String> {
                     .iter_common_name()
                     .next()
                     .and_then(|cn| cn.as_str().ok());
-                return subject.map(|s| s.to_string());
+                return subject.map(std::string::ToString::to_string);
             }
             _ => Option::<String>::None,
         };
@@ -108,7 +109,7 @@ async fn process_url(
     let mut version_bytes = [0u8; 4];
     version_bytes.copy_from_slice(&body[4..8]);
     let version_u32 = u32::from_le_bytes(version_bytes);
-    let dt = Utc.timestamp_opt(version_u32 as i64, 0).single();
+    let dt = Utc.timestamp_opt(i64::from(version_u32), 0).single();
     let utc_string = dt.map(|d| d.to_rfc3339());
 
     Ok(NetscalerHost {
@@ -131,6 +132,46 @@ fn insert_netscaler_to_db(conn: &Arc<Mutex<Connection>>, host: &NetscalerHost) -
     Ok(())
 }
 
+fn setup_database() -> (Arc<Mutex<Connection>>, Vec<String>)  {
+    // This function is used for initialisation, so errors here cause exits
+    // The goal is to create a database if needed. If it exists, read existing hosts so they can be skipped
+    let db_conn: Arc<Mutex<Connection>> = match Connection::open(DB_NAME) {
+        Ok(conn) => Arc::new(Mutex::new(conn)),
+        Err(e) => {
+            eprintln!("Error opening database {}: {}", DB_NAME, e);
+            std::process::exit(1);
+        }
+    };
+
+    let db_conn2 = Arc::clone(&db_conn);
+    let unlocked_conn = db_conn2.lock().unwrap();
+    unlocked_conn.execute(
+        "CREATE TABLE IF NOT EXISTS netscaler_versions (
+            host_ip    TEXT PRIMARY KEY,
+            version  TEXT,
+            version_date  TEXT,
+            host_name  TEXT
+        )",
+        (), // empty list of parameters.
+    ).unwrap_or_else(|e| {
+        eprintln!("Error creating table in database {}: {}", DB_NAME, e);
+        std::process::exit(1);
+    });
+
+    let mut stmt = unlocked_conn.prepare(
+        "SELECT host_ip FROM netscaler_versions").unwrap_or_else(|e| {
+        eprintln!("Error querying initial database {}: {}", DB_NAME, e);
+        std::process::exit(1);
+    });
+    let host_iter = stmt.query_map([], |row| row.get(0)).unwrap_or_else(|e| {
+        eprintln!("Error querying initial database {}: {}", DB_NAME, e);
+        std::process::exit(1);
+    });
+
+    let hosts: Vec<String> = host_iter.filter_map(Result::ok).collect();
+    (db_conn, hosts)
+}
+
 #[tokio::main]
 async fn main() {
     // Create vector of CitrixNetscalerVersion from SOURCE
@@ -151,35 +192,22 @@ async fn main() {
         }
     };
 
-    let db_conn = match Connection::open(DB_NAME) {
-        Ok(conn) => Arc::new(Mutex::new(conn)),
-        Err(e) => {
-            eprintln!("Error opening database {}: {}", DB_NAME, e);
-            return;
-        }
-    };
-    /*
-    db_conn.execute(
-        "CREATE TABLE netscaler_versions (
-            host_ip    TEXT PRIMARY KEY,
-            version  TEXT,
-            version_date  TEXT,
-            host_name  TEXT
-        )",
-        (), // empty list of parameters.
-    ).unwrap(); */
-
-    let concurrency_limit = 256;
-    let semaphore = std::sync::Arc::new(Semaphore::new(concurrency_limit));
+    let (db_conn, existing_hosts) = setup_database();
+    let semaphore = std::sync::Arc::new(Semaphore::new(CONCURRENCY_LIMIT));
 
     // Spawn all requests concurrently, but limit concurrency
     let futures = hosts.map_while(Result::ok).map(|host_ip| {
+        let existing_hosts = &existing_hosts;
         let client = &client;
         let versions = &versions;
         let semaphore = semaphore.clone();
         let db_conn = Arc::clone(&db_conn);
 
         async move {
+            if existing_hosts.contains(&host_ip) {
+                dbg!("Skipping existing host: ", host_ip);
+                return;
+            }
             // Acquire a permit before proceeding
             let _permit = semaphore.acquire_owned().await.unwrap();
 
@@ -191,8 +219,9 @@ async fn main() {
                     version_date: None,
                     host_name: Some("Invalid IP address".to_string()),
                 };
-                let _ = insert_netscaler_to_db(&db_conn, &scanned_host);
-                return dbg!(scanned_host);
+                insert_netscaler_to_db(&db_conn, &scanned_host).unwrap();
+                //dbg!(scanned_host);
+                return;
             }
 
             match process_url(client, &host_ip).await {
@@ -207,8 +236,11 @@ async fn main() {
                         .find(|v| v.rdx_en_date == *version_date)
                         .map_or("Unknown", |v| &v.version);
                     scanned_host.version = Some(version.to_string());
-                    let _ = insert_netscaler_to_db(&db_conn, &scanned_host);
-                    dbg!(scanned_host)
+                    // Common failure here is duplicates in the source hosts file. Just log and continue
+                    insert_netscaler_to_db(&db_conn, &scanned_host).unwrap_or_else(|opt| {
+                        eprintln!("Error inserting into database for host {}: {}", scanned_host.host_ip, opt);
+                    })  ;
+                    //dbg!(scanned_host);
                 }
                 Err(e) => {
                     let scanned_host: NetscalerHost = NetscalerHost {
@@ -218,7 +250,7 @@ async fn main() {
                         host_name: Some(e.to_string()),
                     };
                     let _ = insert_netscaler_to_db(&db_conn, &scanned_host);
-                    dbg!(scanned_host)
+                    //dbg!(scanned_host);
                 }
             }
             // _permit is dropped here, releasing the slot

@@ -11,3 +11,9 @@ reqwest = "0.12.23"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 tokio = { version = "1.47.1", features = ["full"] }
 x509-parser = "0.18.0"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+strip = true

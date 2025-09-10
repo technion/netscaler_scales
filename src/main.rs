@@ -8,7 +8,6 @@ use std::io::{self, BufRead};
 use std::path::Path;
 use tokio::sync::Semaphore;
 use x509_parser::prelude::*;
-use std::error::Error;
 use std::{thread, time::Duration};
 
 struct CitrixNetscalerVersion {

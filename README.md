@@ -8,7 +8,7 @@ https://github.com/fox-it/citrix-netscaler-triage/blob/main/scan-citrix-netscale
 ## Features (planned)
 
 - Rust based async code with a goal of faster, large scale scanning
-- Output to an SQLite database for better management
+- Outputs to CSV. (SQLite has been abandoned due to concurency issues I couldn't fix)
 - Resumable (sort of), will ignore IP addresses already in the database
 - Release executable built for easy running from Windows
 - Detailed "which CVE may apply to this version" is left to the user

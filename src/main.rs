@@ -8,6 +8,8 @@ use std::io::{self, BufRead};
 use std::path::Path;
 use tokio::sync::Semaphore;
 use x509_parser::prelude::*;
+use std::error::Error;
+use std::{thread, time::Duration};
 
 struct CitrixNetscalerVersion {
     pub rdx_en_date: String,
@@ -24,7 +26,7 @@ struct NetscalerHost {
 
 // From the source material, convert the timestamps by replacing spaces with a T
 static SOURCE: &str = include_str!("versions.csv");
-const CONCURRENCY_LIMIT: usize = 256;
+const CONCURRENCY_LIMIT: usize = 16;
 
 fn parse_source() -> Vec<CitrixNetscalerVersion> {
     SOURCE
@@ -154,6 +156,7 @@ async fn main() {
         let client = &client;
         let versions = &versions;
         let semaphore = semaphore.clone();
+        thread::sleep(Duration::from_millis(5));
 
         async move {
             // Acquire a permit before proceeding
@@ -195,8 +198,7 @@ async fn main() {
                         version_date: None,
                         host_name: Some(e.to_string()),
                     };
-                    let _ = insert_netscaler_to_db(&scanned_host);
-                    //dbg!(scanned_host);
+                    insert_netscaler_to_db(&scanned_host);
                 }
             }
             // _permit is dropped here, releasing the slot

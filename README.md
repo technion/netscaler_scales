@@ -17,6 +17,7 @@ https://github.com/fox-it/citrix-netscaler-triage/blob/main/scan-citrix-netscale
 
 - Create hosts.txt containing as many IP addresses as required
 - Run the executable
+- This was designed with Windows in mind but I couldn't get the network stack to not fall over
 
 ## Code Goals
 
@@ -24,9 +25,7 @@ https://github.com/fox-it/citrix-netscaler-triage/blob/main/scan-citrix-netscale
 - Panic free
 - Resilient errors on any individual host
 
-## Creating a hosts list
-
-```powershell
-$csv = import-csv ".\CVE-2025-7775-Citrix-Netscaler.csv" -Header "IP"
-$csv | Sort-Object -Property IP -Unique | Export-Csv -NoTypeInformation hosts.txt
-```
+## Running
+- Increase ulimit with `ulimit -n 32768`
+- Create a hosts.txt file
+- Run it
